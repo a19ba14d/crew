@@ -16,7 +16,7 @@ Claude Code 的多角色执行任务 skill。输入 `/crew <任务>`，调度员
 装到用户级目录，所有项目都能用：
 
 ```bash
-gh repo clone a19ba14d/crew && cd crew
+git clone https://github.com/a19ba14d/crew.git && cd crew
 mkdir -p ~/.claude/skills ~/.claude/agents
 cp -R skills/crew ~/.claude/skills/
 cp agents/*.md ~/.claude/agents/
