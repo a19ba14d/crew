@@ -1,0 +1,484 @@
+#!/usr/bin/env python3
+"""crew-run：无人值守运行 /crew，实时输出可读日志和心跳，并把运行记录存到日志目录。
+
+用法：crew-run [选项] 任务描述 [-- 原样传给 claude 的参数]
+退出码：0 通过或已回答；1 未通过、无法验证或待确认；2 运行出错、超时或找不到 /crew；130 手动中断。
+只用 Python 标准库。
+"""
+import argparse
+import datetime as dt
+import itertools
+import json
+import os
+import queue
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import threading
+import time
+from pathlib import Path
+
+ROLES = {"crew-planner": "规划员", "crew-coder": "开发员", "crew-verifier": "验证员"}
+# 最终汇报的结果行，比如「- **结果**：通过」。结果词前面只允许空格、星号这类符号，「部分通过」这种不算
+VERDICT_RE = re.compile(r"(?m)^[\s>*_#-]*结果[ \t*_]*[:：][^\n一-鿿]{0,12}?(未通过|不通过|无法验证|待确认|已回答|通过)")
+EXIT_CODES = {"通过": 0, "已回答": 0, "未通过": 1, "不通过": 1, "无法验证": 1, "待确认": 1}
+CONCLUSION_RE = re.compile(r"(?m)^[ \t>*_#-]*结论[ \t*_]*[:：][ \t*_]*(\S.*)$")
+ITEM_RE = re.compile(r"([-*+]|\d+[.)、])\s")
+CD_RE = re.compile(r"""^cd\s+(?:"([^"]+)"|'([^']+)'|([^\s;&|]+))\s*&&\s*""")
+
+
+def one_line(text, limit=100):
+    text = " ".join(str(text).split())
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def last_line(text, limit=80):
+    lines = [line.strip() for line in re.sub(r"</?[\w-]+>", "", str(text)).splitlines() if line.strip()]
+    return one_line(lines[-1], limit) if lines else "没有输出"
+
+
+def text_of(content):
+    if isinstance(content, list):
+        return "\n".join(part.get("text", "") for part in content if isinstance(part, dict))
+    return str(content or "")
+
+
+def parse_json(text):
+    try:
+        value = json.loads(text)
+    except ValueError:
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def duration(seconds):
+    seconds = int(seconds)
+    if seconds < 60:
+        return f"{seconds}s"
+    minutes, seconds = divmod(seconds, 60)
+    if minutes < 60:
+        return f"{minutes}m{seconds:02d}s"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h{minutes:02d}m"
+
+
+def iso(timestamp):
+    return dt.datetime.fromtimestamp(timestamp).astimezone().isoformat(timespec="seconds")
+
+
+def home_short(path):
+    home, path = str(Path.home()), str(path)
+    return "~" + path[len(home):] if path.startswith(home + os.sep) else path
+
+
+def project_name(cwd):
+    try:
+        out = subprocess.run(["git", "rev-parse", "--show-toplevel"], cwd=cwd,
+                             capture_output=True, text=True, timeout=5)
+        if out.returncode == 0 and out.stdout.strip():
+            return Path(out.stdout.strip()).name
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return cwd.name or "root"
+
+
+def has(names, name):
+    return any(str(item) == name or str(item).endswith(":" + name) for item in names)
+
+
+def describe(name, inp, cwd):
+    """把一次工具调用写成一句话，比如「Bash: go test ./...」「Edit: internal/user/login.go」。"""
+    if name == "Bash":
+        command = str(inp.get("command", "")).strip()
+        found = CD_RE.match(command)
+        if found and os.path.realpath(next(g for g in found.groups() if g)) == os.path.realpath(cwd):
+            command = command[found.end():]  # 去掉开头的「cd 项目目录 &&」，才看得到真正跑的命令
+        return "Bash: " + one_line(command)
+    path = inp.get("file_path") or inp.get("notebook_path")
+    if path:
+        rel = os.path.relpath(path, cwd) if os.path.isabs(path) else path
+        return f"{name}: {path if rel.startswith('..') else rel}"
+    detail = inp.get("pattern") or inp.get("query") or inp.get("url") or inp.get("description") or inp.get("path")
+    return f"{name}: {one_line(detail, 80)}" if detail else str(name)
+
+
+def sections(text):
+    """按「## 标题」拆开角色汇报，每节只留有内容的行（去掉「无」）。"""
+    parts, current = {}, None
+    for raw in text.splitlines():
+        line = raw.strip()
+        if line.startswith("## "):
+            current = line[3:].strip()
+            parts[current] = []
+        elif current is not None and line and line.lstrip("-* ").strip() != "无":
+            parts[current].append(line)
+    return parts
+
+
+def count_items(lines):
+    return sum(bool(ITEM_RE.match(line)) for line in lines)
+
+
+def key_line(report):
+    """从角色汇报里挑最关键的一句：验证员的结论、规划员的难度、开发员改了几处。"""
+    parts = sections(report)
+    found = CONCLUSION_RE.search(report)
+    if found:
+        problems = count_items(parts.get("问题", []))
+        return "结论：" + one_line(found.group(1).strip("* "), 40) + (f"，问题 {problems} 个" if problems else "")
+    if parts.get("难度"):
+        bits = ["难度 " + one_line(parts["难度"][0].lstrip("-* "), 50)]
+        changes = count_items(parts.get("改动清单", []))
+        bits.append(f"改动 {changes} 处" if changes else "没有改动")
+        if count_items(parts.get("待确认", [])):
+            bits.append(f"待确认 {count_items(parts['待确认'])} 项")
+        return "，".join(bits)
+    if "已改动" in parts:
+        bits = [f"已改动 {count_items(parts['已改动'])} 处"]
+        for name, label, unit in (("计划外改动", "计划外", "处"), ("未完成或拿不准", "拿不准", "项")):
+            if count_items(parts.get(name, [])):
+                bits.append(f"{label} {count_items(parts[name])} {unit}")
+        return "，".join(bits)
+    return one_line(next((line for line in report.splitlines() if line.strip()), "（空）"), 80)
+
+
+def pump(stream, lines):
+    for line in stream:
+        lines.put(line)
+    lines.put(None)
+
+
+class Run:
+    def __init__(self, args, task, extra):
+        self.args, self.task, self.extra = args, task, extra
+        self.cwd = Path.cwd()
+        self.project = project_name(self.cwd)
+        root = Path(args.log_dir).expanduser()
+        name = f"{self.project}-{dt.datetime.now():%Y%m%d-%H%M%S}"
+        for n in itertools.count(1):  # 同一秒启动两次也不共用目录
+            self.dir = root / (name if n == 1 else f"{name}-{n}")
+            try:
+                self.dir.mkdir(parents=True)
+                break
+            except FileExistsError:
+                continue
+        (self.dir / "handoffs").mkdir()
+        self.log = open(self.dir / "run.log", "a", encoding="utf-8", buffering=1)
+        self.events = open(self.dir / "events.jsonl", "a", encoding="utf-8", buffering=1)
+        self.proc = None
+        self.start = self.last_event = self.last_print = self.last_said = self.last_tick = time.time()
+        self.started = self.model_shown = self.stall_warned = False
+        self.timed_out = self.interrupted = self.no_skill = False
+        self.handoffs = 0
+        self.role_of_tool = {}   # 调度员的 Agent 调用 id → 角色，子代理的事件靠它认人
+        self.role_of_agent = {}  # 子代理的 agentId → 角色，续用时靠它认人
+        self.sends = {}          # 调度员的 SendMessage 调用 id → 角色
+        self.running = {}        # 还没结束的工具调用或子代理 → (角色, 动作或 None, 开始时间)
+        self.final = ""          # 最后一段非空输出，就是调度员的最终汇报
+        self.final_is_error = False
+        self.error = ""          # claude 报的错误类型，比如 error_max_turns
+        self.cost = self.session_id = self.verdict = self.exit_code = None
+        self.state = "running"
+
+    # ---------- 输出 ----------
+
+    def say(self, who, text, heartbeat=False):
+        pad = " " * max(1, 7 - sum(2 if ord(ch) > 0x2E80 else 1 for ch in who))
+        line = f"{time.strftime('%H:%M:%S')} {who}{pad}{text}"
+        print(line, flush=True)
+        self.log.write(line + "\n")
+        self.last_print = time.time()
+        if not heartbeat:
+            self.last_said = self.last_print
+
+    def save_handoff(self, title, text):
+        self.handoffs += 1
+        path = self.dir / "handoffs" / f"{self.handoffs:02d}-{title}.md"
+        path.write_text(str(text).rstrip() + "\n", encoding="utf-8")
+
+    def current(self, now):
+        actions = [item for item in self.running.values() if item[1]]
+        if actions:
+            role, action, since = max(actions, key=lambda item: item[2])
+            return f"{role}在跑 {action}（已 {duration(now - since)}）"
+        workers = [item for item in self.running.values() if not item[1]]
+        role = max(workers, key=lambda item: item[2])[0] if workers else "调度员"
+        return f"{role}在思考（已 {duration(now - self.last_said)}）"
+
+    def write_status(self):
+        now = time.time()
+        status = {
+            "state": self.state, "verdict": self.verdict, "exit_code": self.exit_code,
+            "task": self.task, "project": self.project, "cwd": str(self.cwd), "run_dir": str(self.dir),
+            "pid": self.proc.pid if self.proc else None, "session_id": self.session_id,
+            "started_at": iso(self.start), "updated_at": iso(now), "elapsed_s": int(now - self.start),
+            "last_event_at": iso(self.last_event),
+            "current": self.current(now) if self.state == "running" else None,
+            "cost_usd": self.cost,
+        }
+        tmp = self.dir / "status.json.tmp"
+        tmp.write_text(json.dumps(status, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        os.replace(tmp, self.dir / "status.json")
+
+    # ---------- 心跳、卡住、超时 ----------
+
+    def tick(self):
+        now = self.last_tick = time.time()
+        args = self.args
+        if args.heartbeat and now - self.last_print >= args.heartbeat:
+            self.say("♥", f"已运行 {duration(now - self.start)}，{self.current(now)}", heartbeat=True)
+        if args.stall and not self.stall_warned and now - self.last_event >= args.stall * 60:
+            self.stall_warned = True
+            self.say("⚠", f"已经 {duration(now - self.last_event)} 没有任何事件，进程还在，可能卡住了")
+        if args.timeout and not self.timed_out and now - self.start >= args.timeout * 60:
+            self.timed_out = True
+            self.say("超时", f"超过 {args.timeout:g} 分钟上限，终止运行")
+            self.stop()
+        self.write_status()
+
+    def stop(self):
+        """终止 claude 和它启动的所有子进程（比如正在跑的测试）：先发 TERM，10 秒内没退出就 KILL。"""
+        if not self.proc or self.proc.poll() is not None:
+            return
+        for sig, wait in ((signal.SIGTERM, 10), (signal.SIGKILL, None)):
+            try:
+                os.killpg(self.proc.pid, sig)
+                self.proc.wait(wait)
+                return
+            except ProcessLookupError:
+                return
+            except (subprocess.TimeoutExpired, KeyboardInterrupt):  # 等不及，或者又按了一次 Ctrl-C
+                continue
+
+    # ---------- 解析事件流 ----------
+
+    def feed(self, line):
+        self.events.write(line)
+        self.last_event, self.stall_warned = time.time(), False
+        if not line.lstrip().startswith("{"):  # 不是事件就原样转出来，比如 claude 直接打印的报错
+            if line.strip():
+                self.say("claude", one_line(line, 160))
+            return
+        try:
+            event = json.loads(line)
+            if isinstance(event, dict):
+                self.handle(event)
+        except Exception as exc:  # 事件格式变了也不能让日志中断
+            self.say("⚠", f"有一行事件解析失败：{type(exc).__name__}: {one_line(exc, 80)}")
+
+    def handle(self, event):
+        kind, sub = event.get("type"), event.get("subtype")
+        parent = event.get("parent_tool_use_id")
+        if kind == "system" and sub == "init":
+            if not self.started:  # 每开一轮都会再来一个 init，只看第一个
+                self.started = True
+                self.on_init(event)
+        elif kind == "assistant":
+            message = event.get("message") or {}
+            who = self.role_of_tool.get(parent, "子代理") if parent else "调度员"
+            model = str(message.get("model") or "")
+            if not parent and not self.model_shown and model and not model.startswith("<"):
+                self.model_shown = True  # skill 里设的模型以这里为准，init 里的是会话默认模型
+                self.say("调度员", f"模型 {model}")
+            for block in message.get("content") or []:
+                if not isinstance(block, dict):
+                    continue
+                if block.get("type") == "tool_use":
+                    self.on_tool_use(who, bool(parent), block)
+                elif block.get("type") == "text" and not parent and (block.get("text") or "").strip():
+                    self.show_text(block["text"])
+        elif kind == "user":
+            content = (event.get("message") or {}).get("content")
+            for block in content if isinstance(content, list) else []:
+                if isinstance(block, dict) and block.get("type") == "tool_result":
+                    self.on_tool_result(block)
+        elif kind == "system" and sub == "task_started":
+            tool_id, task_id = event.get("tool_use_id"), event.get("task_id")
+            role = self.role_of_tool.get(tool_id) or self.sends.get(tool_id) or ROLES.get(event.get("subagent_type"))
+            if role:
+                # task_id 就是 agentId；续用的子代理没有新的 Agent 调用，只能从这里知道它又开始干活了
+                self.role_of_agent.setdefault(task_id, role)
+                self.running[task_id] = (role, None, time.time())
+        elif kind == "system" and sub == "task_notification":
+            self.running.pop(event.get("task_id"), None)
+        elif kind == "rate_limit_event":
+            status = (event.get("rate_limit_info") or {}).get("status")
+            if status and status != "allowed":
+                self.say("⚠", f"用量限制：{status}")
+        elif kind == "result":
+            # 续用子代理时，调度员会先结束一轮、等汇报回来再开一轮，所以会有多个 result，以最后一个非空的为准
+            self.session_id = event.get("session_id") or self.session_id
+            if isinstance(event.get("total_cost_usd"), (int, float)):
+                self.cost = event["total_cost_usd"]
+            text = event.get("result") or ""
+            if text.strip():
+                self.final, self.final_is_error = text, bool(event.get("is_error"))
+            elif event.get("is_error"):
+                self.final_is_error = True
+            if event.get("is_error"):
+                self.error = event.get("subtype") or "error"
+
+    def show_text(self, text):
+        """调度员说的话逐行显示，最多 5 行。最终汇报在结束时整段输出，这里跳过。"""
+        if VERDICT_RE.search(text):
+            return
+        lines = [one_line(re.sub(r"\*\*|`", "", raw), 120) for raw in text.splitlines()]
+        lines = [line for line in lines if line]
+        for line in lines[:5]:
+            self.say("调度员", line)
+        if len(lines) > 5:
+            self.say("调度员", f"……还有 {len(lines) - 5} 行，见 events.jsonl")
+
+    def on_init(self, event):
+        self.session_id = event.get("session_id")
+        commands, agents = event.get("slash_commands"), event.get("agents")
+        if commands is not None and not has(commands, "crew"):
+            self.no_skill = True
+            self.say("出错", "这个会话里没有 /crew：先安装 skill，或者到装了 skill 的项目目录里运行")
+            self.stop()
+            return
+        missing = [name for name in ROLES if agents is not None and not has(agents, name)]
+        if missing:
+            self.say("⚠", "缺少角色定义：" + "、".join(missing) + "，先把 agents/ 下的文件装好")
+
+    def on_tool_use(self, who, in_subagent, block):
+        name, inp, tool_id = block.get("name"), block.get("input") or {}, block.get("id")
+        if name == "ToolSearch":
+            return
+        if not in_subagent and name == "Agent":
+            role = ROLES.get(inp.get("subagent_type"), inp.get("subagent_type") or "子代理")
+            self.role_of_tool[tool_id] = role
+            self.running[tool_id] = (role, None, time.time())
+            self.say("调度员", f"→ {role}（{inp.get('model') or '默认模型'} / {inp.get('effort') or '默认思考程度'}）")
+            self.save_handoff(f"派给{role}", inp.get("prompt", ""))
+        elif not in_subagent and name == "SendMessage":
+            role = self.role_of_agent.get(inp.get("to"), "子代理")
+            self.sends[tool_id] = role
+            self.running[tool_id] = (role, None, time.time())
+            self.say("调度员", f"→ {role}（续用上一轮的{role}）")
+            self.save_handoff(f"发给{role}", inp.get("message", ""))
+        elif in_subagent and name == "SubagentHandback":
+            report = str(inp.get("message", ""))
+            self.say(who, f"→ 调度员：{key_line(report)}")
+            self.save_handoff(f"{who}汇报", report)
+        else:
+            action = describe(name, inp, self.cwd)
+            self.running[tool_id] = (who, action, time.time())
+            self.say(who, action)
+
+    def on_tool_result(self, block):
+        tool_id = block.get("tool_use_id")
+        item = self.running.pop(tool_id, None)
+        body = text_of(block.get("content"))
+        if tool_id in self.sends:
+            reply = parse_json(body)
+            if reply.get("success") is False:
+                self.say("⚠", f"续用{self.sends[tool_id]}失败：{one_line(reply.get('message') or body, 100)}")
+        elif tool_id in self.role_of_tool:
+            found = re.search(r"agentId:\s*([0-9a-z]+)", body)
+            if found:
+                self.role_of_agent.setdefault(found.group(1), self.role_of_tool[tool_id])
+        if block.get("is_error") and item:
+            role, action, _ = item
+            self.say(role, f"✗ {action}：{last_line(body)}" if action else f"✗ 出错：{last_line(body)}")
+
+    # ---------- 主流程 ----------
+
+    def run(self):
+        mode = self.args.permission_mode
+        cmd = ["claude", "-p", f"/crew {self.task}", "--output-format", "stream-json", "--verbose"]
+        cmd += ["--permission-mode", mode] if mode else ["--dangerously-skip-permissions"]
+        cmd += self.extra
+        self.say("启动", f"项目 {self.project}，{'权限模式 ' + mode if mode else '跳过权限检查'}，"
+                         f"日志 {home_short(self.dir)}")
+        stderr = open(self.dir / "stderr.log", "w", encoding="utf-8")
+        self.proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=stderr,
+                                     text=True, encoding="utf-8", errors="replace", start_new_session=True)
+        self.write_status()
+        lines = queue.Queue()
+        threading.Thread(target=pump, args=(self.proc.stdout, lines), daemon=True).start()
+        try:
+            while True:
+                try:
+                    line = lines.get(timeout=1)
+                except queue.Empty:
+                    line = ""
+                if line is None:
+                    break
+                if line:
+                    self.feed(line)
+                if time.time() - self.last_tick >= 1:
+                    self.tick()
+        except KeyboardInterrupt:
+            self.interrupted = True
+            self.say("中断", "收到中断信号，终止运行")
+            self.stop()
+        self.proc.wait()
+        stderr.close()
+        return self.finish()
+
+    def finish(self):
+        if self.final:
+            (self.dir / "result.md").write_text(self.final.rstrip() + "\n", encoding="utf-8")
+            print("\n" + self.final.rstrip() + "\n", flush=True)
+            self.log.write("\n" + self.final.rstrip() + "\n\n")
+        found = VERDICT_RE.search(self.final)
+        if self.interrupted:
+            self.state, self.exit_code, summary = "interrupted", 130, "已中断"
+        elif self.timed_out:
+            self.state, self.exit_code, summary = "timeout", 2, "超时终止"
+        elif self.no_skill:
+            self.state, self.exit_code, summary = "error", 2, "找不到 /crew"
+        elif self.final_is_error or not self.final:
+            err = (self.dir / "stderr.log").read_text(encoding="utf-8", errors="replace").strip()
+            detail = last_line(err, 120) if err else self.error or f"claude 退出码 {self.proc.returncode}"
+            self.state, self.exit_code, summary = "error", 2, f"运行出错（{detail}）"
+        elif found:
+            self.verdict = found.group(1)
+            self.state, self.exit_code, summary = "done", EXIT_CODES[self.verdict], self.verdict
+        else:
+            self.state, self.exit_code, summary = "error", 2, "最终汇报里没有可识别的「结果」行"
+        cost = f"，${self.cost:.2f}" if self.cost is not None else ""
+        self.say("结束", f"{summary}，用时 {duration(time.time() - self.start)}{cost}，日志 {home_short(self.dir)}")
+        if self.verdict == "待确认":
+            self.say("提示", "把答复补进任务描述，重新运行 crew-run")
+        self.write_status()
+        self.log.close()
+        self.events.close()
+        return self.exit_code
+
+
+def main():
+    argv, extra = sys.argv[1:], []
+    if "--" in argv:
+        cut = argv.index("--")
+        argv, extra = argv[:cut], argv[cut + 1:]
+    parser = argparse.ArgumentParser(
+        prog="crew-run",
+        description="无人值守运行 /crew：实时输出可读日志和心跳，运行记录存到日志目录。"
+                    "默认跳过所有权限检查，只在信任的项目里用。「--」之后的参数原样传给 claude。",
+        epilog="退出码：0 通过或已回答；1 未通过、无法验证或待确认；2 运行出错、超时或找不到 /crew；130 手动中断。")
+    parser.add_argument("task", nargs="+", help="任务描述")
+    parser.add_argument("--heartbeat", type=float, default=30, metavar="秒",
+                        help="终端多久没有输出就打一行心跳（默认 30，0 表示不打）")
+    parser.add_argument("--stall", type=float, default=10, metavar="分钟",
+                        help="多久没有任何事件就提示可能卡住，只提示不终止（默认 10，0 表示不提示）")
+    parser.add_argument("--timeout", type=float, default=60, metavar="分钟",
+                        help="总时长上限，超过就终止（默认 60，0 表示不限）")
+    parser.add_argument("--log-dir", default="~/.crew/runs", metavar="目录",
+                        help="日志根目录（默认 ~/.crew/runs）")
+    parser.add_argument("--permission-mode", metavar="模式",
+                        help="不跳过权限检查，改用这个权限模式，比如 auto")
+    args = parser.parse_args(argv)
+    if not shutil.which("claude"):
+        print("crew-run：找不到 claude 命令", file=sys.stderr)
+        return 2
+    sys.stdout.reconfigure(errors="replace")
+    signal.signal(signal.SIGTERM, signal.default_int_handler)  # 被 kill 时也走中断流程，顺手停掉 claude
+    return Run(args, " ".join(args.task), extra).run()
+
+
+if __name__ == "__main__":
+    sys.exit(main())
