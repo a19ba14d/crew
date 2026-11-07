@@ -27,7 +27,7 @@ cp agents/*.md ~/.claude/agents/
 ## 用法
 
 - 会话里：`/crew 给登录接口加手机号格式校验`
-- 命令行无人值守：`claude -p "/crew 给登录接口加手机号格式校验" --permission-mode auto`
+- 命令行无人值守：`claude --dangerously-skip-permissions -p "/crew 给登录接口加手机号格式校验"`。这个参数会跳过所有权限检查，执行中不会被拦，只在你信任的项目里用。
 
 ## 改默认设置
 
