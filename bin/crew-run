@@ -2,7 +2,7 @@
 """crew-run：无人值守运行 /crew，实时输出可读日志和心跳，并把运行记录存到日志目录。
 
 用法：crew-run [选项] 任务描述 [-- 原样传给 claude 的参数]
-退出码：0 通过或已回答；1 未通过、无法验证或待确认；2 运行出错、超时或找不到 /crew；130 手动中断。
+退出码：0 通过或已回答；1 未通过、无法验证或待确认；2 运行出错、超时、找不到 /crew 或结果行不规范；130 手动中断。
 只用 Python 标准库。
 """
 import argparse
@@ -21,12 +21,17 @@ import time
 from pathlib import Path
 
 ROLES = {"crew-planner": "规划员", "crew-coder": "开发员", "crew-verifier": "验证员"}
-# 最终汇报的结果行，比如「- **结果**：通过」。结果词前面只允许空格、星号这类符号，「部分通过」这种不算
-VERDICT_RE = re.compile(r"(?m)^[\s>*_#-]*结果[ \t*_]*[:：][^\n一-鿿]{0,12}?(未通过|不通过|无法验证|待确认|已回答|通过)")
+# 最终汇报里的结果行，比如「- **结果**：通过」
+RESULT_LINE_RE = re.compile(r"(?m)^[ \t>*_#-]*结果[ \t*_]*[:：].*$")
+# 规范的结果行：「结果：」后面只有一个结果词，前后只允许空格、星号、引号、emoji 这类符号。
+# 「部分通过」「通过率 0%」「通过（只读任务）」都不算，免得把失败或含糊的结果当成通过
+VERDICT_RE = re.compile(r"[ \t>*_#-]*结果[ \t*_]*[:：](?:[^\w\n]|_){0,12}?"
+                        r"(未通过|不通过|无法验证|待确认|已回答|通过)(?:[^\w\n]|_)*")
 EXIT_CODES = {"通过": 0, "已回答": 0, "未通过": 1, "不通过": 1, "无法验证": 1, "待确认": 1}
 CONCLUSION_RE = re.compile(r"(?m)^[ \t>*_#-]*结论[ \t*_]*[:：][ \t*_]*(\S.*)$")
 ITEM_RE = re.compile(r"([-*+]|\d+[.)、])\s")
 CD_RE = re.compile(r"""^cd\s+(?:"([^"]+)"|'([^']+)'|([^\s;&|]+))\s*&&\s*""")
+SCAN_EVERY = 3  # 每隔几秒顺着进程树记一次 claude 子孙进程所在的进程组
 
 
 def one_line(text, limit=100):
@@ -150,6 +155,40 @@ def pump(stream, lines):
     lines.put(None)
 
 
+def process_groups(root):
+    """root 和它所有子孙进程所在的进程组。Claude Code 的 Bash 工具会把每条命令放进单独的进程组，
+    只终止 claude 自己的进程组管不到正在跑的测试、服务，所以要顺着进程树找。"""
+    try:
+        out = subprocess.run(["ps", "-A", "-o", "pid=,ppid=,pgid="], capture_output=True, text=True,
+                             timeout=10).stdout
+    except (OSError, subprocess.SubprocessError):
+        return set()
+    children, group = {}, {}
+    for line in out.splitlines():
+        fields = line.split()
+        if len(fields) == 3 and all(field.isdigit() for field in fields):
+            pid, ppid, pgid = map(int, fields)
+            children.setdefault(ppid, []).append(pid)
+            group[pid] = pgid
+    found, todo, seen = set(), [root], set()
+    while todo:
+        pid = todo.pop()
+        if pid not in seen:
+            seen.add(pid)
+            found.add(group.get(pid))
+            todo.extend(children.get(pid, []))
+    own = os.getpgrp()
+    return {pgid for pgid in found if pgid and pgid > 1 and pgid != own}
+
+
+def group_exists(pgid):
+    try:
+        os.killpg(pgid, 0)
+    except OSError:  # 组里已经没有进程，或者没有权限管
+        return False
+    return True
+
+
 class Run:
     def __init__(self, args, task, extra):
         self.args, self.task, self.extra = args, task, extra
@@ -168,15 +207,17 @@ class Run:
         self.log = open(self.dir / "run.log", "a", encoding="utf-8", buffering=1)
         self.events = open(self.dir / "events.jsonl", "a", encoding="utf-8", buffering=1)
         self.proc = None
+        self.groups = set()      # claude 和它子孙进程所在的进程组，终止和清理时用
+        self.last_scan = 0.0
         self.start = self.last_event = self.last_print = self.last_said = self.last_tick = time.time()
         self.started = self.model_shown = self.stall_warned = False
-        self.timed_out = self.interrupted = self.no_skill = False
+        self.timed_out = self.interrupted = self.no_skill = self.stopped = False
         self.handoffs = 0
         self.role_of_tool = {}   # 调度员的 Agent 调用 id → 角色，子代理的事件靠它认人
         self.role_of_agent = {}  # 子代理的 agentId → 角色，续用时靠它认人
         self.sends = {}          # 调度员的 SendMessage 调用 id → 角色
         self.running = {}        # 还没结束的工具调用或子代理 → (角色, 动作或 None, 开始时间)
-        self.final = ""          # 最后一段非空输出，就是调度员的最终汇报
+        self.outputs = []        # 每一轮结束时的非空输出；最终汇报是最后一段带「结果」行的
         self.final_is_error = False
         self.error = ""          # claude 报的错误类型，比如 error_max_turns
         self.cost = self.session_id = self.verdict = self.exit_code = None
@@ -232,25 +273,63 @@ class Run:
         if args.stall and not self.stall_warned and now - self.last_event >= args.stall * 60:
             self.stall_warned = True
             self.say("⚠", f"已经 {duration(now - self.last_event)} 没有任何事件，进程还在，可能卡住了")
-        if args.timeout and not self.timed_out and now - self.start >= args.timeout * 60:
+        if self.proc.poll() is None and now - self.last_scan >= SCAN_EVERY:
+            self.scan_groups()
+        over = args.timeout and now - self.start >= args.timeout * 60
+        if over and not self.timed_out and self.proc.poll() is None:  # claude 已经自己退出的，不算超时
             self.timed_out = True
             self.say("超时", f"超过 {args.timeout:g} 分钟上限，终止运行")
             self.stop()
         self.write_status()
 
     def stop(self):
-        """终止 claude 和它启动的所有子进程（比如正在跑的测试）：先发 TERM，10 秒内没退出就 KILL。"""
-        if not self.proc or self.proc.poll() is not None:
-            return
-        for sig, wait in ((signal.SIGTERM, 10), (signal.SIGKILL, None)):
+        """终止运行（超时、中断、找不到 /crew 时）：连同 claude 启动的进程一起终止，只做一次。"""
+        if self.proc and not self.stopped:
+            self.stopped = True
+            self.kill_tree()
+
+    def scan_groups(self):
+        """顺着进程树补记 claude 子孙进程所在的进程组。命令跑完以后，它丢在后台的进程会脱离进程树，
+        所以运行中要定期记，不能等到终止时才找。"""
+        self.last_scan = time.time()
+        self.groups |= process_groups(self.proc.pid)
+        return self.alive_groups()
+
+    def alive_groups(self):
+        """记下的进程组里还有进程的那些。先回收已经退出的 claude，免得它的僵尸进程让它的组看起来还在。"""
+        self.proc.poll()
+        self.groups = {pgid for pgid in self.groups if group_exists(pgid)}
+        return self.groups
+
+    def kill_tree(self):
+        """终止 claude 和它启动的所有进程，包括 Bash 工具放在别的进程组里的测试、服务：
+        先发 TERM，最多等 10 秒，还没退的发 KILL。不能只看 claude 自己退没退：
+        不理 TERM 的子进程会一直跑，还可能占着输出管道让 crew-run 卡住。"""
+        for sig, wait in ((signal.SIGTERM, 10), (signal.SIGKILL, 5)):
+            # claude 还活着时进程树是完整的，发信号前再找一遍
+            for pgid in self.scan_groups() if self.proc.poll() is None else self.alive_groups():
+                try:
+                    os.killpg(pgid, sig)
+                except OSError:
+                    pass
+            deadline = time.time() + wait
             try:
-                os.killpg(self.proc.pid, sig)
-                self.proc.wait(wait)
-                return
-            except ProcessLookupError:
-                return
-            except (subprocess.TimeoutExpired, KeyboardInterrupt):  # 等不及，或者又按了一次 Ctrl-C
+                while self.alive_groups() and time.time() < deadline:
+                    time.sleep(0.2)
+            except KeyboardInterrupt:  # 等的时候又按了一次 Ctrl-C：不等了，直接 KILL
                 continue
+            if not self.groups:
+                return
+
+    def clean_leftovers(self):
+        """claude 自己退出后，它启动的进程 2 秒内还没退的，一并清理，免得一直在跑或者占着输出管道。"""
+        deadline = time.time() + 2
+        while self.alive_groups():
+            if time.time() >= deadline:
+                self.say("⚠", "claude 已经退出，它启动的进程还有没退的，一并清理")
+                self.kill_tree()
+                return
+            time.sleep(0.2)
 
     # ---------- 解析事件流 ----------
 
@@ -308,13 +387,14 @@ class Run:
             if status and status != "allowed":
                 self.say("⚠", f"用量限制：{status}")
         elif kind == "result":
-            # 续用子代理时，调度员会先结束一轮、等汇报回来再开一轮，所以会有多个 result，以最后一个非空的为准
+            # 续用子代理时，调度员会先结束一轮、等汇报回来再开一轮，所以会有多个 result，每段非空的都留着
             self.session_id = event.get("session_id") or self.session_id
             if isinstance(event.get("total_cost_usd"), (int, float)):
                 self.cost = event["total_cost_usd"]
             text = event.get("result") or ""
             if text.strip():
-                self.final, self.final_is_error = text, bool(event.get("is_error"))
+                self.outputs.append(text)
+                self.final_is_error = bool(event.get("is_error"))
             elif event.get("is_error"):
                 self.final_is_error = True
             if event.get("is_error"):
@@ -322,7 +402,7 @@ class Run:
 
     def show_text(self, text):
         """调度员说的话逐行显示，最多 5 行。最终汇报在结束时整段输出，这里跳过。"""
-        if VERDICT_RE.search(text):
+        if RESULT_LINE_RE.search(text):
             return
         lines = [one_line(re.sub(r"\*\*|`", "", raw), 120) for raw in text.splitlines()]
         lines = [line for line in lines if line]
@@ -386,6 +466,24 @@ class Run:
 
     # ---------- 主流程 ----------
 
+    def save_baseline(self):
+        """工作区开始前就有改动时提示一句，并把已跟踪文件的改动存成 baseline.diff，万一被动了还能找回来。"""
+        try:
+            status = subprocess.run(["git", "status", "--short"], cwd=self.cwd, capture_output=True,
+                                    text=True, timeout=10)
+            if status.returncode != 0 or not status.stdout.strip():
+                return
+            diff = subprocess.run(["git", "diff", "--binary", "HEAD"], cwd=self.cwd, capture_output=True,
+                                  timeout=30)
+        except (OSError, subprocess.SubprocessError):
+            return
+        note = ""
+        if diff.returncode == 0 and diff.stdout:
+            (self.dir / "baseline.diff").write_bytes(diff.stdout)
+            note = "，已跟踪文件的改动存到了 baseline.diff"
+        count = len(status.stdout.splitlines())
+        self.say("⚠", f"工作区开始前就有 {count} 处没提交的改动{note}；最好先提交或 stash 再跑")
+
     def run(self):
         mode = self.args.permission_mode
         cmd = ["claude", "-p", f"/crew {self.task}", "--output-format", "stream-json", "--verbose"]
@@ -393,12 +491,15 @@ class Run:
         cmd += self.extra
         self.say("启动", f"项目 {self.project}，{'权限模式 ' + mode if mode else '跳过权限检查'}，"
                          f"日志 {home_short(self.dir)}")
+        self.save_baseline()
         stderr = open(self.dir / "stderr.log", "w", encoding="utf-8")
         self.proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=stderr,
                                      text=True, encoding="utf-8", errors="replace", start_new_session=True)
+        self.groups = {self.proc.pid}  # claude 是自己进程组的组长
         self.write_status()
         lines = queue.Queue()
         threading.Thread(target=pump, args=(self.proc.stdout, lines), daemon=True).start()
+        eof, exited_at = False, None
         try:
             while True:
                 try:
@@ -406,40 +507,65 @@ class Run:
                 except queue.Empty:
                     line = ""
                 if line is None:
-                    break
-                if line:
+                    eof = True
+                elif line:
                     self.feed(line)
                 if time.time() - self.last_tick >= 1:
-                    self.tick()
+                    self.tick()  # claude 关了输出但还没退出时，也照样心跳、检查超时
+                if self.proc.poll() is None:
+                    continue
+                if exited_at is None:
+                    if not self.stopped:
+                        self.clean_leftovers()
+                    exited_at = time.time()
+                # 输出读完就收尾；脱离了进程组的进程还占着输出管道时，最多再等 5 秒
+                if eof:
+                    break
+                if time.time() - exited_at >= 5:
+                    self.say("⚠", "claude 已经退出，输出管道还被别的进程占着（可能是自己脱离了进程组的后台进程），不再等了")
+                    break
         except KeyboardInterrupt:
             self.interrupted = True
             self.say("中断", "收到中断信号，终止运行")
             self.stop()
-        self.proc.wait()
         stderr.close()
         return self.finish()
 
     def finish(self):
-        if self.final:
-            (self.dir / "result.md").write_text(self.final.rstrip() + "\n", encoding="utf-8")
-            print("\n" + self.final.rstrip() + "\n", flush=True)
-            self.log.write("\n" + self.final.rstrip() + "\n\n")
-        found = VERDICT_RE.search(self.final)
+        # 最终汇报取最后一段带「结果」行的输出：汇报之后，调度员可能还会回别的话
+        report = next((text for text in reversed(self.outputs) if RESULT_LINE_RE.search(text)),
+                      self.outputs[-1] if self.outputs else "")
+        if report:
+            (self.dir / "result.md").write_text(report.rstrip() + "\n", encoding="utf-8")
+            print("\n" + report.rstrip() + "\n", flush=True)
+            self.log.write("\n" + report.rstrip() + "\n\n")
+        line = RESULT_LINE_RE.search(report)
+        found = VERDICT_RE.fullmatch(line.group(0).strip()) if line else None
+        code = self.proc.poll()
         if self.interrupted:
             self.state, self.exit_code, summary = "interrupted", 130, "已中断"
         elif self.timed_out:
             self.state, self.exit_code, summary = "timeout", 2, "超时终止"
         elif self.no_skill:
             self.state, self.exit_code, summary = "error", 2, "找不到 /crew"
-        elif self.final_is_error or not self.final:
+        elif code != 0 or self.final_is_error or not report:
+            # claude 没有正常结束，汇报里写什么都不算数，交给人看
             err = (self.dir / "stderr.log").read_text(encoding="utf-8", errors="replace").strip()
-            detail = last_line(err, 120) if err else self.error or f"claude 退出码 {self.proc.returncode}"
-            self.state, self.exit_code, summary = "error", 2, f"运行出错（{detail}）"
-        elif found:
+            exit_note = ("claude 没有退出" if code is None else f"claude 被信号 {-code} 终止" if code < 0
+                         else f"claude 退出码 {code}" if code else "")
+            bits = [exit_note, self.error, last_line(err, 120) if err else ""]
+            summary = "运行出错（" + ("，".join(bit for bit in bits if bit) or "没有最终汇报") + "）"
+            if found:
+                summary += f"，汇报里写的是「{found.group(1)}」，需要人工核对"
+            self.state, self.exit_code = "error", 2
+        elif not line:
+            self.state, self.exit_code, summary = "error", 2, "最终汇报里没有「结果」行"
+        elif not found:
+            self.state, self.exit_code = "error", 2
+            summary = f"结果行不规范：{one_line(line.group(0).strip(), 60)}"
+        else:
             self.verdict = found.group(1)
             self.state, self.exit_code, summary = "done", EXIT_CODES[self.verdict], self.verdict
-        else:
-            self.state, self.exit_code, summary = "error", 2, "最终汇报里没有可识别的「结果」行"
         cost = f"，${self.cost:.2f}" if self.cost is not None else ""
         self.say("结束", f"{summary}，用时 {duration(time.time() - self.start)}{cost}，日志 {home_short(self.dir)}")
         if self.verdict == "待确认":
@@ -459,7 +585,7 @@ def main():
         prog="crew-run",
         description="无人值守运行 /crew：实时输出可读日志和心跳，运行记录存到日志目录。"
                     "默认跳过所有权限检查，只在信任的项目里用。「--」之后的参数原样传给 claude。",
-        epilog="退出码：0 通过或已回答；1 未通过、无法验证或待确认；2 运行出错、超时或找不到 /crew；130 手动中断。")
+        epilog="退出码：0 通过或已回答；1 未通过、无法验证或待确认；2 运行出错、超时、找不到 /crew 或结果行不规范；130 手动中断。")
     parser.add_argument("task", nargs="+", help="任务描述")
     parser.add_argument("--heartbeat", type=float, default=30, metavar="秒",
                         help="终端多久没有输出就打一行心跳（默认 30，0 表示不打）")
