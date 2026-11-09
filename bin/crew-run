@@ -2,7 +2,9 @@
 """crew-run：无人值守运行 /crew，实时输出可读日志和心跳，并把运行记录存到日志目录。
 
 用法：crew-run [选项] 任务描述 [-- 原样传给 claude 的参数]
-退出码：0 通过或已回答；1 未通过、无法验证或待确认；2 运行出错、超时、找不到 /crew 或结果行不规范；130 手动中断。
+      crew-run --resume 日志目录 答复      回答待确认的问题，接着那次运行的会话跑
+退出码：0 通过或已回答；1 未通过、无法验证或待确认；2 运行出错、超时、找不到 /crew、结果行不规范或同一目录已有 crew 在跑；
+130 手动中断。
 只用 Python 标准库。
 """
 import argparse
@@ -12,6 +14,7 @@ import json
 import os
 import queue
 import re
+import shlex
 import shutil
 import signal
 import subprocess
@@ -30,8 +33,13 @@ VERDICT_RE = re.compile(r"[ \t>*_#-]*结果[ \t*_]*[:：](?:[^\w\n]|_){0,12}?"
 EXIT_CODES = {"通过": 0, "已回答": 0, "未通过": 1, "不通过": 1, "无法验证": 1, "待确认": 1}
 CONCLUSION_RE = re.compile(r"(?m)^[ \t>*_#-]*结论[ \t*_]*[:：][ \t*_]*(\S.*)$")
 ITEM_RE = re.compile(r"([-*+]|\d+[.)、])\s")
-CD_RE = re.compile(r"""^cd\s+(?:"([^"]+)"|'([^']+)'|([^\s;&|]+))\s*&&\s*""")
+CD_RE = re.compile(r"""^cd\s+(?:"([^"]+)"|'([^']+)'|([^\s;&|]+))\s*(?:&&|;)\s*""")
+QUESTION_RE = re.compile(r"\d+[.)、]\s")
+JSON_BLOCK_RE = re.compile(r"```json[ \t]*\n(.*?)\n[ \t]*```", re.S)  # 待确认汇报最后附的问题数据
+MAX_QUESTIONS, MAX_CHOICES = 4, 4  # Hermes 的 clarify 和 Claude Code 的 AskUserQuestion 都能接受的上限
 SCAN_EVERY = 3  # 每隔几秒顺着进程树记一次 claude 子孙进程所在的进程组
+STOP_GRACE = 1.0  # 终止时发 TERM 后等几秒再发 KILL。Hermes 停后台进程时只给 2 秒就强杀，
+                  # 整个停止过程平时 1.1 秒左右，给机器忙时留出余量
 
 
 def one_line(text, limit=100):
@@ -99,7 +107,7 @@ def describe(name, inp, cwd):
         command = str(inp.get("command", "")).strip()
         found = CD_RE.match(command)
         if found and os.path.realpath(next(g for g in found.groups() if g)) == os.path.realpath(cwd):
-            command = command[found.end():]  # 去掉开头的「cd 项目目录 &&」，才看得到真正跑的命令
+            command = command[found.end():]  # 去掉开头的「cd 项目目录 &&」或「cd 项目目录;」，才看得到真正跑的命令
         return "Bash: " + one_line(command)
     path = inp.get("file_path") or inp.get("notebook_path")
     if path:
@@ -110,20 +118,23 @@ def describe(name, inp, cwd):
 
 
 def sections(text):
-    """按「## 标题」拆开角色汇报，每节只留有内容的行（去掉「无」）。"""
+    """按「## 标题」拆开角色汇报，每节只留有内容的行（去掉「无」）。保留缩进，数条目时好分出嵌套的子条目。"""
     parts, current = {}, None
     for raw in text.splitlines():
-        line = raw.strip()
-        if line.startswith("## "):
-            current = line[3:].strip()
+        line = raw.rstrip()
+        if line.lstrip().startswith("## "):
+            current = line.lstrip()[3:].strip()
             parts[current] = []
-        elif current is not None and line and line.lstrip("-* ").strip() != "无":
+        elif current is not None and line.strip().lstrip("-* ").strip() not in ("", "无"):
             parts[current].append(line)
     return parts
 
 
 def count_items(lines):
-    return sum(bool(ITEM_RE.match(line)) for line in lines)
+    """只数顶层条目，缩进更深的子条目不算：规划员常在一个文件下面再分几条写具体改动。"""
+    indents = [len(line) - len(line.lstrip()) for line in lines if ITEM_RE.match(line.lstrip())]
+    top = min(indents, default=0)
+    return sum(indent == top for indent in indents)
 
 
 def key_line(report):
@@ -134,11 +145,14 @@ def key_line(report):
         problems = count_items(parts.get("问题", []))
         return "结论：" + one_line(found.group(1).strip("* "), 40) + (f"，问题 {problems} 个" if problems else "")
     if parts.get("难度"):
-        bits = ["难度 " + one_line(parts["难度"][0].lstrip("-* "), 50)]
+        bits = ["难度 " + one_line(parts["难度"][0].lstrip("-* ").rstrip("。"), 50)]
         changes = count_items(parts.get("改动清单", []))
         bits.append(f"改动 {changes} 处" if changes else "没有改动")
-        if count_items(parts.get("待确认", [])):
-            bits.append(f"待确认 {count_items(parts['待确认'])} 项")
+        asks = parts.get("待确认", [])
+        # 编号的是问题，「-」是选项；选项没缩进时也不会数成问题
+        asked = sum(bool(QUESTION_RE.match(line.lstrip())) for line in asks) or count_items(asks)
+        if asked:
+            bits.append(f"待确认 {asked} 项")
         return "，".join(bits)
     if "已改动" in parts:
         bits = [f"已改动 {count_items(parts['已改动'])} 处"]
@@ -147,6 +161,55 @@ def key_line(report):
                 bits.append(f"{label} {count_items(parts[name])} {unit}")
         return "，".join(bits)
     return one_line(next((line for line in report.splitlines() if line.strip()), "（空）"), 80)
+
+
+def questions_of(report):
+    """待确认汇报最后那段 json 里的问题，整理成 Hermes clarify 的 questions 参数；没有或不规范返回 None。"""
+    blocks = JSON_BLOCK_RE.findall(report)
+    items = parse_json(blocks[-1]).get("questions") if blocks else None
+    if not isinstance(items, list) or not 1 <= len(items) <= MAX_QUESTIONS:
+        return None
+    questions = []
+    for item in items:
+        if not isinstance(item, dict):
+            return None
+        text, choices = item.get("question"), item.get("choices") or []
+        if not isinstance(text, str) or not text.strip() or not isinstance(choices, list):
+            return None
+        choices = [choice.strip() for choice in choices if isinstance(choice, str) and choice.strip()]
+        if len(choices) == 1 or len(choices) > MAX_CHOICES:
+            return None
+        question = {"question": text.strip()}
+        if choices:
+            question["choices"] = choices
+        if item.get("multi_select") is True:
+            question["multi_select"] = True
+        questions.append(question)
+    return questions
+
+
+def read_status(path):
+    try:
+        return parse_json(Path(path).read_text(encoding="utf-8"))
+    except OSError:
+        return {}
+
+
+def running_here(root, cwd):
+    """日志根目录里还在跑、项目目录也相同的那次运行；状态没来得及更新、进程其实已经不在的不算。"""
+    for path in sorted(root.glob("*/status.json")):
+        status = read_status(path)
+        pid = status.get("pid")
+        if status.get("state") != "running" or status.get("cwd") != str(cwd) or not isinstance(pid, int):
+            continue
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            continue
+        except PermissionError:  # 进程在，只是不归我们管
+            pass
+        return path.parent
+    return None
 
 
 def pump(stream, lines):
@@ -189,12 +252,20 @@ def group_exists(pgid):
     return True
 
 
+def ignore_signals():
+    """收尾阶段不再理会中断信号：终止进程加写状态不到两秒，被打断反而会留下残局。"""
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        signal.signal(sig, signal.SIG_IGN)
+
+
 class Run:
-    def __init__(self, args, task, extra):
+    def __init__(self, args, task, extra, root, resumed_from=None, resume_session=None, cost_base=0.0):
         self.args, self.task, self.extra = args, task, extra
+        self.mode = args.permission_mode or "bypassPermissions"
+        self.resumed_from, self.resume_session = resumed_from, resume_session
+        self.cost_base = cost_base  # 续跑时会话之前那些轮的累计费用
         self.cwd = Path.cwd()
         self.project = project_name(self.cwd)
-        root = Path(args.log_dir).expanduser()
         name = f"{self.project}-{dt.datetime.now():%Y%m%d-%H%M%S}"
         for n in itertools.count(1):  # 同一秒启动两次也不共用目录
             self.dir = root / (name if n == 1 else f"{name}-{n}")
@@ -220,7 +291,8 @@ class Run:
         self.outputs = []        # 每一轮结束时的非空输出；最终汇报是最后一段带「结果」行的
         self.final_is_error = False
         self.error = ""          # claude 报的错误类型，比如 error_max_turns
-        self.cost = self.session_id = self.verdict = self.exit_code = None
+        self.session_cost = self.session_id = self.verdict = self.exit_code = None
+        self.questions = self.resume_cmd = None  # 待确认时的问题和接着跑的命令
         self.state = "running"
 
     # ---------- 输出 ----------
@@ -248,16 +320,25 @@ class Run:
         role = max(workers, key=lambda item: item[2])[0] if workers else "调度员"
         return f"{role}在思考（已 {duration(now - self.last_said)}）"
 
+    def run_cost(self):
+        """这次运行的费用。续跑时 claude 报的是整个会话的累计费用，要减掉之前那些轮的。"""
+        if self.session_cost is None:
+            return None
+        return self.session_cost - self.cost_base if self.session_cost >= self.cost_base else self.session_cost
+
     def write_status(self):
         now = time.time()
         status = {
             "state": self.state, "verdict": self.verdict, "exit_code": self.exit_code,
             "task": self.task, "project": self.project, "cwd": str(self.cwd), "run_dir": str(self.dir),
             "pid": self.proc.pid if self.proc else None, "session_id": self.session_id,
+            "resumed_from": str(self.resumed_from) if self.resumed_from else None,
+            "permission_mode": self.mode, "claude_args": self.extra,
             "started_at": iso(self.start), "updated_at": iso(now), "elapsed_s": int(now - self.start),
             "last_event_at": iso(self.last_event),
             "current": self.current(now) if self.state == "running" else None,
-            "cost_usd": self.cost,
+            "cost_usd": self.run_cost(), "session_cost_usd": self.session_cost,
+            "questions": self.questions, "resume": self.resume_cmd,
         }
         tmp = self.dir / "status.json.tmp"
         tmp.write_text(json.dumps(status, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
@@ -303,9 +384,9 @@ class Run:
 
     def kill_tree(self):
         """终止 claude 和它启动的所有进程，包括 Bash 工具放在别的进程组里的测试、服务：
-        先发 TERM，最多等 10 秒，还没退的发 KILL。不能只看 claude 自己退没退：
+        先发 TERM，最多等 STOP_GRACE 秒，还没退的发 KILL。不能只看 claude 自己退没退：
         不理 TERM 的子进程会一直跑，还可能占着输出管道让 crew-run 卡住。"""
-        for sig, wait in ((signal.SIGTERM, 10), (signal.SIGKILL, 5)):
+        for sig, wait in ((signal.SIGTERM, STOP_GRACE), (signal.SIGKILL, 5)):
             # claude 还活着时进程树是完整的，发信号前再找一遍
             for pgid in self.scan_groups() if self.proc.poll() is None else self.alive_groups():
                 try:
@@ -315,7 +396,7 @@ class Run:
             deadline = time.time() + wait
             try:
                 while self.alive_groups() and time.time() < deadline:
-                    time.sleep(0.2)
+                    time.sleep(0.05)  # 查得勤一点：整个停止过程要赶在 Hermes 的 2 秒强杀之前做完
             except KeyboardInterrupt:  # 等的时候又按了一次 Ctrl-C：不等了，直接 KILL
                 continue
             if not self.groups:
@@ -390,7 +471,7 @@ class Run:
             # 续用子代理时，调度员会先结束一轮、等汇报回来再开一轮，所以会有多个 result，每段非空的都留着
             self.session_id = event.get("session_id") or self.session_id
             if isinstance(event.get("total_cost_usd"), (int, float)):
-                self.cost = event["total_cost_usd"]
+                self.session_cost = event["total_cost_usd"]
             text = event.get("result") or ""
             if text.strip():
                 self.outputs.append(text)
@@ -485,13 +566,18 @@ class Run:
         self.say("⚠", f"工作区开始前就有 {count} 处没提交的改动{note}；最好先提交或 stash 再跑")
 
     def run(self):
-        mode = self.args.permission_mode
+        bypass = self.mode == "bypassPermissions"
         cmd = ["claude", "-p", f"/crew {self.task}", "--output-format", "stream-json", "--verbose"]
-        cmd += ["--permission-mode", mode] if mode else ["--dangerously-skip-permissions"]
+        cmd += ["--resume", self.resume_session] if self.resume_session else []
+        cmd += ["--dangerously-skip-permissions"] if bypass else ["--permission-mode", self.mode]
         cmd += self.extra
-        self.say("启动", f"项目 {self.project}，{'权限模式 ' + mode if mode else '跳过权限检查'}，"
-                         f"日志 {home_short(self.dir)}")
-        self.save_baseline()
+        where = f"项目 {self.project}，{'跳过权限检查' if bypass else '权限模式 ' + self.mode}，日志 {home_short(self.dir)}"
+        if self.resumed_from:
+            # 工作区里已经有上一轮 crew 自己的改动，不再当成开始前的改动记录；调度员在会话里记得原来的记录
+            self.say("续跑", f"接着 {home_short(self.resumed_from)} 的会话，{where}")
+        else:
+            self.say("启动", where)
+            self.save_baseline()
         stderr = open(self.dir / "stderr.log", "w", encoding="utf-8")
         self.proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=stderr,
                                      text=True, encoding="utf-8", errors="replace", start_new_session=True)
@@ -525,13 +611,17 @@ class Run:
                     self.say("⚠", "claude 已经退出，输出管道还被别的进程占着（可能是自己脱离了进程组的后台进程），不再等了")
                     break
         except KeyboardInterrupt:
-            self.interrupted = True
+            ignore_signals()
+            self.interrupted = self.stopped = True
+            self.state, self.exit_code = "interrupted", 130
+            self.write_status()  # 先记下状态：Hermes 这类进程管理器 2 秒后就强杀，等不到最后再写
             self.say("中断", "收到中断信号，终止运行")
-            self.stop()
+            self.kill_tree()
         stderr.close()
         return self.finish()
 
     def finish(self):
+        ignore_signals()
         # 最终汇报取最后一段带「结果」行的输出：汇报之后，调度员可能还会回别的话
         report = next((text for text in reversed(self.outputs) if RESULT_LINE_RE.search(text)),
                       self.outputs[-1] if self.outputs else "")
@@ -566,10 +656,24 @@ class Run:
         else:
             self.verdict = found.group(1)
             self.state, self.exit_code, summary = "done", EXIT_CODES[self.verdict], self.verdict
-        cost = f"，${self.cost:.2f}" if self.cost is not None else ""
+        if self.verdict == "待确认":
+            self.questions = questions_of(report)
+            self.resume_cmd = f"crew-run --resume {shlex.quote(str(self.dir))}"
+            if self.questions:
+                (self.dir / "questions.json").write_text(
+                    json.dumps({"questions": self.questions}, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        cost = self.run_cost()
+        if cost is None:
+            cost = ""
+        elif cost == self.session_cost:
+            cost = f"，${cost:.2f}"
+        else:  # 续跑：这次的和整个会话累计的分开写
+            cost = f"，这次 ${cost:.2f}，会话累计 ${self.session_cost:.2f}"
         self.say("结束", f"{summary}，用时 {duration(time.time() - self.start)}{cost}，日志 {home_short(self.dir)}")
         if self.verdict == "待确认":
-            self.say("提示", "把答复补进任务描述，重新运行 crew-run")
+            where = (f"有 {len(self.questions)} 个问题等你答复，见 questions.json" if self.questions
+                     else "问题见上面的汇报（汇报里没有规范的问题数据，没生成 questions.json）")
+            self.say("提示", f"{where}；答复后运行：{self.resume_cmd} \"答复\"")
         self.write_status()
         self.log.close()
         self.events.close()
@@ -585,25 +689,55 @@ def main():
         prog="crew-run",
         description="无人值守运行 /crew：实时输出可读日志和心跳，运行记录存到日志目录。"
                     "默认跳过所有权限检查，只在信任的项目里用。「--」之后的参数原样传给 claude。",
-        epilog="退出码：0 通过或已回答；1 未通过、无法验证或待确认；2 运行出错、超时、找不到 /crew 或结果行不规范；130 手动中断。")
-    parser.add_argument("task", nargs="+", help="任务描述")
+        epilog="退出码：0 通过或已回答；1 未通过、无法验证或待确认；2 运行出错、超时、找不到 /crew、结果行不规范"
+               "或同一目录已有 crew 在跑；130 手动中断。")
+    parser.add_argument("task", nargs="+", help="任务描述；续跑时是你对问题的答复")
     parser.add_argument("--heartbeat", type=float, default=30, metavar="秒",
                         help="终端多久没有输出就打一行心跳（默认 30，0 表示不打）")
     parser.add_argument("--stall", type=float, default=10, metavar="分钟",
                         help="多久没有任何事件就提示可能卡住，只提示不终止（默认 10，0 表示不提示）")
     parser.add_argument("--timeout", type=float, default=60, metavar="分钟",
                         help="总时长上限，超过就终止（默认 60，0 表示不限）")
-    parser.add_argument("--log-dir", default="~/.crew/runs", metavar="目录",
-                        help="日志根目录（默认 ~/.crew/runs）")
+    parser.add_argument("--log-dir", metavar="目录",
+                        help="日志根目录（默认 ~/.crew/runs；续跑时默认和原来那次放在一起）")
     parser.add_argument("--permission-mode", metavar="模式",
                         help="不跳过权限检查，改用这个权限模式，比如 auto")
+    parser.add_argument("--resume", metavar="日志目录",
+                        help="回答待确认的问题，接着那次运行的会话跑：在原来的项目目录里跑，"
+                             "沿用原来的权限设置和「--」之后的参数")
     args = parser.parse_args(argv)
     if not shutil.which("claude"):
         print("crew-run：找不到 claude 命令", file=sys.stderr)
         return 2
+    task, resumed_from, session, cost_base = " ".join(args.task), None, None, 0.0
+    if args.resume:
+        resumed_from = Path(os.path.abspath(Path(args.resume).expanduser()))
+        prev = read_status(resumed_from / "status.json")
+        session, cwd = prev.get("session_id"), prev.get("cwd")
+        if not session or not cwd:
+            print(f"crew-run：{args.resume} 里没有能接着跑的会话（status.json 里没有 session_id 或 cwd）",
+                  file=sys.stderr)
+            return 2
+        try:
+            os.chdir(cwd)  # 会话按项目目录存，换了目录 claude 找不到
+        except OSError as exc:
+            print(f"crew-run：进不了原来的项目目录 {cwd}：{exc.strerror}", file=sys.stderr)
+            return 2
+        task = "续：" + task
+        args.permission_mode = args.permission_mode or prev.get("permission_mode")
+        if not extra and isinstance(prev.get("claude_args"), list):
+            extra = [str(arg) for arg in prev["claude_args"]]
+        args.log_dir = args.log_dir or str(resumed_from.parent)
+        base = prev.get("session_cost_usd", prev.get("cost_usd"))  # claude 续跑时报的费用是会话累计的
+        cost_base = base if isinstance(base, (int, float)) else 0.0
+    root = Path(os.path.abspath(Path(args.log_dir or "~/.crew/runs").expanduser()))
+    busy = running_here(root, Path.cwd())
+    if busy:
+        print(f"crew-run：这个目录已经有 crew 在跑（日志 {home_short(busy)}），等它结束或者先停掉再跑", file=sys.stderr)
+        return 2
     sys.stdout.reconfigure(errors="replace")
     signal.signal(signal.SIGTERM, signal.default_int_handler)  # 被 kill 时也走中断流程，顺手停掉 claude
-    return Run(args, " ".join(args.task), extra).run()
+    return Run(args, task, extra, root, resumed_from, session, cost_base).run()
 
 
 if __name__ == "__main__":
