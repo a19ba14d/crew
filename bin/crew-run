@@ -163,11 +163,9 @@ def key_line(report):
     return one_line(next((line for line in report.splitlines() if line.strip()), "（空）"), 80)
 
 
-def questions_of(report):
-    """待确认汇报最后那段 json 里的问题，整理成 Hermes clarify 的 questions 参数；没有或不规范返回 None。"""
-    blocks = JSON_BLOCK_RE.findall(report)
-    items = parse_json(blocks[-1]).get("questions") if blocks else None
-    if not isinstance(items, list) or not 1 <= len(items) <= MAX_QUESTIONS:
+def ask_list(items):
+    """把一组问题整理成 Hermes clarify 的 questions 参数那种格式；不规范返回 None。"""
+    if not isinstance(items, list) or len(items) > MAX_QUESTIONS:
         return None
     questions = []
     for item in items:
@@ -186,6 +184,17 @@ def questions_of(report):
             question["multi_select"] = True
         questions.append(question)
     return questions
+
+
+def asks_of(report):
+    """待确认汇报最后那段 json 里的两类问题：questions 要用户拍板，evidence 要启动 crew 的一方自己去查清。
+    返回 (questions, evidence)，没有的那一类是空列表；没有 json、不规范或两类都空返回 None。"""
+    blocks = JSON_BLOCK_RE.findall(report)
+    data = parse_json(blocks[-1]) if blocks else {}
+    questions, evidence = ask_list(data.get("questions", [])), ask_list(data.get("evidence", []))
+    if questions is None or evidence is None or len(questions) + len(evidence) == 0:
+        return None
+    return questions, evidence
 
 
 def read_status(path):
@@ -292,7 +301,8 @@ class Run:
         self.final_is_error = False
         self.error = ""          # claude 报的错误类型，比如 error_max_turns
         self.session_cost = self.session_id = self.verdict = self.exit_code = None
-        self.questions = self.resume_cmd = None  # 待确认时的问题和接着跑的命令
+        # 待确认时：要用户拍板的问题、要启动 crew 的一方查清的事、接着跑的命令
+        self.questions = self.evidence = self.resume_cmd = None
         self.state = "running"
 
     # ---------- 输出 ----------
@@ -338,7 +348,7 @@ class Run:
             "last_event_at": iso(self.last_event),
             "current": self.current(now) if self.state == "running" else None,
             "cost_usd": self.run_cost(), "session_cost_usd": self.session_cost,
-            "questions": self.questions, "resume": self.resume_cmd,
+            "questions": self.questions, "evidence": self.evidence, "resume": self.resume_cmd,
         }
         tmp = self.dir / "status.json.tmp"
         tmp.write_text(json.dumps(status, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
@@ -657,11 +667,13 @@ class Run:
             self.verdict = found.group(1)
             self.state, self.exit_code, summary = "done", EXIT_CODES[self.verdict], self.verdict
         if self.verdict == "待确认":
-            self.questions = questions_of(report)
+            questions, evidence = asks_of(report) or (None, None)
+            self.questions, self.evidence = questions or None, evidence or None
             self.resume_cmd = f"crew-run --resume {shlex.quote(str(self.dir))}"
-            if self.questions:
-                (self.dir / "questions.json").write_text(
-                    json.dumps({"questions": self.questions}, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            for name, items in (("questions", self.questions), ("evidence", self.evidence)):
+                if items:  # 两类分开存：questions.json 可以原样交给 clarify，evidence.json 不是给用户选的
+                    (self.dir / f"{name}.json").write_text(
+                        json.dumps({name: items}, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         cost = self.run_cost()
         if cost is None:
             cost = ""
@@ -671,9 +683,16 @@ class Run:
             cost = f"，这次 ${cost:.2f}，会话累计 ${self.session_cost:.2f}"
         self.say("结束", f"{summary}，用时 {duration(time.time() - self.start)}{cost}，日志 {home_short(self.dir)}")
         if self.verdict == "待确认":
-            where = (f"有 {len(self.questions)} 个问题等你答复，见 questions.json" if self.questions
-                     else "问题见上面的汇报（汇报里没有规范的问题数据，没生成 questions.json）")
-            self.say("提示", f"{where}；答复后运行：{self.resume_cmd} \"答复\"")
+            # 这几行会进到调用方的结束通知里。只看退出码的调用方（比如 Hermes 的后台任务通知）
+            # 会把待确认显示成失败、建议重跑，所以先把话说死
+            self.say("提示", "这不是失败，不要重跑：crew 停下来等答复，会话和已经做的改动都留着")
+            bits = []
+            if self.questions:
+                bits.append(f"有 {len(self.questions)} 个问题要用户拍板，见 questions.json")
+            if self.evidence:
+                bits.append(f"有 {len(self.evidence)} 件事要先查清，见 evidence.json（由启动 crew 的一方去查，不要拿去问用户）")
+            self.say("提示", "；".join(bits) or "问题见上面的汇报（汇报里没有规范的问题数据，没生成 questions.json 和 evidence.json）")
+            self.say("提示", f"答复后接着跑：{self.resume_cmd} \"答复\"")
         self.write_status()
         self.log.close()
         self.events.close()
